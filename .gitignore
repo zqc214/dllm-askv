@@ -1,0 +1,6 @@
+*.log
+evals_results/
+dct1.0/
+dct_matrix/
+generate_2.py
+__pycache__/
