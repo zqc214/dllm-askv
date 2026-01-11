@@ -357,15 +357,25 @@ def generate_with_dual_cache(
             
             current_retention = 0.5 
             ANCHOR_LAYERS = [0, 8, 16, 24]
+            
+            # [Fix] 先收集所有锚点层的 retention，确保所有层使用统一值
+            retention_values = []
+            for layer_idx in ANCHOR_LAYERS:
+                if layer_idx < len(past_key_values):
+                    curr_probe_kv = past_key_values[layer_idx][0][:, :, analyze_start:analyze_end, :]
+                    _, _, E_curr = compute_complexity_probe(prev_tokens, curr_probe_kv, tokenizer)
+                    retention = compute_adaptive_retention_ratio(D_base, P_base, E_curr)
+                    retention_values.append(retention)
+            
+            # 使用平均 retention（确保所有层 KV 长度一致）
+            if retention_values:
+                current_retention = sum(retention_values) / len(retention_values)
+                if DEBUG:
+                    print(f"  [Unified Retention] Using average R={current_retention:.2f} for all layers")
+            
             new_past_key_values = []
             
             for layer_idx, layer in enumerate(past_key_values):
-                # --- 分组探针逻辑 ---
-                if layer_idx in ANCHOR_LAYERS:
-                    curr_probe_kv = layer[0][:, :, analyze_start:analyze_end, :]
-                    _, _, E_curr = compute_complexity_probe(prev_tokens, curr_probe_kv, tokenizer)
-                    current_retention = compute_adaptive_retention_ratio(D_base, P_base, E_curr)
-
                 layer_kv = []
                 for kv_tensor in layer:
                     prefix = kv_tensor[:, :, :s, :]
@@ -412,23 +422,39 @@ def generate_with_dual_cache(
 
         # [Fix] 计算压缩后的实际序列长度
         if use_spectral_compression and KEEP_COMPRESSED_LENGTH:
-            # 获取压缩后的实际 KV 长度
+            # 获取压缩后的实际 KV 长度（从第一层）
             actual_kv_len = past_key_values[0][0].shape[2]
-            # r_pre（压缩后）+ current + r_suf = actual_kv_len
-            # current block 在压缩后 KV 中的实际位置
-            # 从 reconstructed = torch.cat([r_pre, current, r_suf], dim=2) 可知
-            # current 的起始位置 = r_pre 的长度
-            compressed_prefix_len = actual_kv_len - (e - s) - (x.shape[1] - e)
-            new_s = compressed_prefix_len
-            new_e = new_s + (e - s)
             
-            # 创建与压缩后 KV 长度匹配的 replace_position
-            replace_pos = torch.zeros((B, actual_kv_len), dtype=torch.bool, device=x.device)
-            replace_pos[:, new_s:new_e] = True
+            # 计算压缩后的 prefix 长度
+            # actual_kv_len = r_pre + current + r_suf
+            current_len = e - s
+            suffix_len = x.shape[1] - e
+            compressed_prefix_len = actual_kv_len - current_len - suffix_len
             
-            if DEBUG and nb == 0:
-                print(f"  [Compressed KV] Original seq: {x.shape[1]}, Compressed KV: {actual_kv_len}")
-                print(f"  [Replace Pos] Original: [{s}:{e}], Compressed: [{new_s}:{new_e}]")
+            # 安全检查：如果没有真正压缩（prefix太短），长度应该和原始一样
+            if compressed_prefix_len < 0:
+                # 没有压缩，使用原始位置
+                replace_pos = torch.zeros_like(x, dtype=torch.bool)
+                replace_pos[:, s:e] = True
+                
+                if DEBUG and nb == 0:
+                    print(f"  [Warning] No compression applied (prefix too short), using original positions")
+            else:
+                # 有压缩，计算新位置
+                new_s = compressed_prefix_len
+                new_e = new_s + current_len
+                
+                # 边界检查
+                if new_e > actual_kv_len:
+                    raise ValueError(f"Replace position out of bounds! new_e={new_e} > actual_kv_len={actual_kv_len}")
+                
+                # 创建与压缩后 KV 长度匹配的 replace_position
+                replace_pos = torch.zeros((B, actual_kv_len), dtype=torch.bool, device=x.device)
+                replace_pos[:, new_s:new_e] = True
+                
+                if DEBUG and nb == 0:
+                    print(f"  [Compressed KV] Original seq: {x.shape[1]}, Compressed KV: {actual_kv_len}")
+                    print(f"  [Replace Pos] Original: [{s}:{e}], Compressed: [{new_s}:{new_e}]")
         else:
             # 原方案：长度不变
             replace_pos = torch.zeros_like(x, dtype=torch.bool)
@@ -535,6 +561,7 @@ def generate_with_prefix_cache(
                 new_past_key_values = []
                 
                 for layer_idx, layer in enumerate(past_key_values):
+                    # --- 分组探针逻辑（Prefix Cache 保持原样，各层独立）---
                     if layer_idx in ANCHOR_LAYERS:
                         curr_probe_kv = layer[0][:, :, analyze_start:analyze_end, :]
                         _, _, E_curr = compute_complexity_probe(prev_tokens, curr_probe_kv, tokenizer)
