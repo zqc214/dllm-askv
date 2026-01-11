@@ -3,7 +3,7 @@
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
 """
-Fast-dLLM + ASKV (Matrix Multiplication Version) + Debug + Fixed Ratio Option
+Fast-dLLM + ASKV (Matrix Multiplication Version) + Debug + Global Config
 """
 
 import torch
@@ -20,12 +20,22 @@ from torch.cuda import nvtx
 # [Debug] 全局调试开关
 DEBUG = True
 
-# [Config] Safety Buffer 配置
+# ======================= [Global Configuration] =======================
+
+# 1. Safety Buffer 配置
 SAFETY_BUFFER_SIZE = 0  # 不压缩最近的 N 个 tokens
 
-# [Config] 压缩策略配置
-KEEP_COMPRESSED_LENGTH = True  # True: 保持压缩长度（节省显存和计算）
-                               # False: 补零还原到原长度（仅测试精度）
+# 2. 压缩长度策略
+# True: 保持压缩长度 (不补零) -> 速度快但 RoPE 会错位，精度会崩 (除非改模型)
+# False: 补零还原 (Zero Padding) -> 速度一般但精度正常 [推荐用于测试保留率效果]
+KEEP_COMPRESSED_LENGTH = False 
+
+# 3. 保留率策略 (这就是您要求添加的功能)
+# set to 0.5 (or any float 0.0-1.0): 强制使用固定保留率，忽略自适应算法
+# set to None: 使用 D/P/E 自适应算法
+FIXED_RETENTION_RATIO = 0.5
+
+# ======================================================================
 
 # ===================== 0. 核心算子: 矩阵乘法 DCT (带调试) =====================
 
@@ -289,14 +299,13 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
                 break
     return x, nfe
 
-# ===================== 5. Dual Cache + Matrix ASKV (Fixed Ratio Support) =====================
+# ===================== 5. Dual Cache + Matrix ASKV (Using Global Config) =====================
 
 @torch.no_grad()
 def generate_with_dual_cache(
     model, tokenizer, prompt, steps=128, gen_length=128, block_length=32, 
     temperature=0., remasking="low_confidence", mask_id=126336, 
-    threshold=None, factor=None, use_spectral_compression=False,
-    fixed_retention_ratio=None # [New] 新增参数
+    threshold=None, factor=None, use_spectral_compression=False
 ):
     B, Lp = prompt.shape[0], int(prompt.shape[1])
     num_blocks = gen_length // block_length
@@ -309,8 +318,10 @@ def generate_with_dual_cache(
     if DEBUG:
         print(f"\n[Dual Cache Mode] Matrix ASKV: {use_spectral_compression}")
         if use_spectral_compression:
-            strategy = f"Fixed Ratio: {fixed_retention_ratio}" if fixed_retention_ratio else "Adaptive"
-            print(f"  Compression Strategy: {strategy}, Keep Length: {KEEP_COMPRESSED_LENGTH}")
+            strategy = f"Fixed Ratio: {FIXED_RETENTION_RATIO}" if FIXED_RETENTION_RATIO is not None else "Adaptive"
+            print(f"  Compression Strategy: {strategy}")
+            print(f"  Keep Compressed Length (No Padding): {KEEP_COMPRESSED_LENGTH}")
+            print(f"  Safety Buffer: {SAFETY_BUFFER_SIZE} tokens")
         print(f"Initial VRAM: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
     for nb in range(num_blocks):
@@ -336,12 +347,12 @@ def generate_with_dual_cache(
 
             current_retention = 0.5 
             
-            # [Logic] 判断是使用固定比例还是自适应算法
-            if fixed_retention_ratio is not None:
+            # [Logic] 读取全局变量
+            if FIXED_RETENTION_RATIO is not None:
                 # === 路径 A: 固定保留率 ===
-                current_retention = fixed_retention_ratio
+                current_retention = FIXED_RETENTION_RATIO
                 if DEBUG and nb == 0:
-                    print(f"  [Fixed] Using Retention = {current_retention:.2f}")
+                    print(f"  [Fixed] Using Global Retention = {current_retention:.2f}")
             else:
                 # === 路径 B: 自适应算法 ===
                 prev_tokens = x[:, analyze_start:analyze_end]
@@ -400,11 +411,30 @@ def generate_with_dual_cache(
                 new_past_key_values.append(tuple(layer_kv))
             past_key_values = tuple(new_past_key_values)
 
-        # [Fix] 这里的长度计算逻辑保持不变 (省略以节省篇幅，与上一版一致)
-        # 如果你使用了KEEP_COMPRESSED_LENGTH=True，需要上面的计算逻辑
-        # 默认这里是 False，所以走原逻辑
-        replace_pos = torch.zeros_like(x, dtype=torch.bool)
-        replace_pos[:, s:e] = True 
+        # [Logic] 使用全局变量判断是否需要计算新位置
+        if use_spectral_compression and KEEP_COMPRESSED_LENGTH:
+            actual_kv_len = past_key_values[0][0].shape[2]
+            current_len = e - s
+            suffix_len = x.shape[1] - e
+            compressed_prefix_len = actual_kv_len - current_len - suffix_len
+            
+            if compressed_prefix_len < 0:
+                replace_pos = torch.zeros_like(x, dtype=torch.bool)
+                replace_pos[:, s:e] = True
+            else:
+                new_s = compressed_prefix_len
+                new_e = new_s + current_len
+                if new_e > actual_kv_len:
+                    raise ValueError(f"Replace position out of bounds! new_e={new_e} > actual_kv_len={actual_kv_len}")
+                
+                replace_pos = torch.zeros((B, actual_kv_len), dtype=torch.bool, device=x.device)
+                replace_pos[:, new_s:new_e] = True
+                
+                if DEBUG and nb == 0:
+                    print(f"  [Compressed Pos] Using updated replace_position for compressed KV")
+        else:
+            replace_pos = torch.zeros_like(x, dtype=torch.bool)
+            replace_pos[:, s:e] = True 
         
         global_mask = (x == mask_id); global_mask[:, e:] = False
         if factor is None:
@@ -443,14 +473,13 @@ def generate_with_dual_cache(
     print(f"\nTotal NFE: {nfe}")
     return x, nfe
 
-# ===================== 6. Prefix Cache + Matrix ASKV (Fixed Ratio Support) =====================
+# ===================== 6. Prefix Cache + Matrix ASKV (Using Global Config) =====================
 
 @torch.no_grad()
 def generate_with_prefix_cache(
     model, tokenizer, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
     remasking='low_confidence', mask_id=126336, threshold=None, factor=None, 
-    use_spectral_compression=False,
-    fixed_retention_ratio=None # [New] 新增参数
+    use_spectral_compression=False
 ):
     x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
     x[:, :prompt.shape[1]] = prompt.clone()
@@ -462,8 +491,9 @@ def generate_with_prefix_cache(
     if DEBUG:
         print(f"\n[Prefix Cache Mode] Matrix ASKV: {use_spectral_compression}")
         if use_spectral_compression:
-            strategy = f"Fixed Ratio: {fixed_retention_ratio}" if fixed_retention_ratio else "Adaptive"
-            print(f"  Compression Strategy: {strategy}, Keep Length: {KEEP_COMPRESSED_LENGTH}")
+            strategy = f"Fixed Ratio: {FIXED_RETENTION_RATIO}" if FIXED_RETENTION_RATIO is not None else "Adaptive"
+            print(f"  Compression Strategy: {strategy}")
+            print(f"  Keep Compressed Length (No Padding): {KEEP_COMPRESSED_LENGTH}")
             
     for num_block in range(num_blocks):
         block_t0 = time.time()
@@ -488,13 +518,12 @@ def generate_with_prefix_cache(
             if analyze_end > 0:
                 current_retention = 0.5
                 
-                # [Logic] 固定 vs 自适应
-                if fixed_retention_ratio is not None:
+                # [Logic] 读取全局变量
+                if FIXED_RETENTION_RATIO is not None:
                     # === 路径 A: 固定保留率 ===
-                    current_retention = fixed_retention_ratio
+                    current_retention = FIXED_RETENTION_RATIO
                 else:
                     # === 路径 B: 自适应算法 ===
-                    # 注意：Prefix 模式为了简化，通常是各层独立计算自适应参数，不需要求平均
                     prev_tokens = x[:, analyze_start:analyze_end]
                     dummy_kv = past_key_values[0][0][:, :, analyze_start:analyze_end, :]
                     D_base, P_base, _ = compute_complexity_probe(prev_tokens, dummy_kv, tokenizer)
@@ -504,7 +533,7 @@ def generate_with_prefix_cache(
                 
                 for layer_idx, layer in enumerate(past_key_values):
                     # 仅在自适应模式下需要计算 E 值
-                    if fixed_retention_ratio is None and layer_idx in ANCHOR_LAYERS:
+                    if FIXED_RETENTION_RATIO is None and layer_idx in ANCHOR_LAYERS:
                         curr_probe_kv = layer[0][:, :, analyze_start:analyze_end, :]
                         _, _, E_curr = compute_complexity_probe(prev_tokens, curr_probe_kv, tokenizer)
                         current_retention = compute_adaptive_retention_ratio(D_base, P_base, E_curr)
@@ -610,9 +639,6 @@ def main():
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--factor", type=float, default=None)
     parser.add_argument("--use_spectral_compression", action="store_true")
-    # [New] 新增固定比例参数
-    parser.add_argument("--fixed_retention_ratio", type=float, default=None, 
-                        help="Set a fixed retention ratio (e.g., 0.5). If None, use adaptive.")
 
     args = parser.parse_args()
     device = 'cuda'
@@ -636,14 +662,12 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:"""
     if args.dual_cache:
         generate_with_dual_cache(
             model, tokenizer, input_ids, args.steps, args.gen_length, args.block_length,
-            args.temperature, args.threshold, args.factor, args.use_spectral_compression,
-            fixed_retention_ratio=args.fixed_retention_ratio # 传入参数
+            args.temperature, args.threshold, args.factor, args.use_spectral_compression
         )
     elif args.use_cache:
         generate_with_prefix_cache(
             model, tokenizer, input_ids, args.steps, args.gen_length, args.block_length,
-            args.temperature, args.threshold, args.factor, args.use_spectral_compression,
-            fixed_retention_ratio=args.fixed_retention_ratio # 传入参数
+            args.temperature, args.threshold, args.factor, args.use_spectral_compression
         )
     else:
         generate(
