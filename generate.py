@@ -23,6 +23,10 @@ DEBUG = True
 # [Config] Safety Buffer 配置
 SAFETY_BUFFER_SIZE = 0  # 不压缩最近的 N 个 tokens
 
+# [Config] 压缩策略配置
+KEEP_COMPRESSED_LENGTH = True  # True: 保持压缩长度（节省显存和计算）
+                               # False: 补零还原到原长度（仅测试精度）
+
 # ===================== 0. 核心算子: 矩阵乘法 DCT (带调试) =====================
 
 _DCT_MAT_CACHE = {}
@@ -91,7 +95,8 @@ def dct_compress_matrix(x, retention_ratio):
     # [Debug] 打印压缩耗时 (随机采样防止刷屏)
     if DEBUG and x.shape[1] > 0 and torch.rand(1).item() < 0.01:
         t_cost = (time.perf_counter() - t0) * 1000
-        print(f"  [Compress] L={L} -> K={num_keep} (R={retention_ratio:.2f}) | Cost: {t_cost:.2f}ms")
+        compression_ratio = (1 - num_keep / L) * 100
+        print(f"  [Compress] L={L} -> K={num_keep} (R={retention_ratio:.2f}, Save={compression_ratio:.1f}%) | Cost: {t_cost:.2f}ms")
 
     return {
         'coeffs': compressed_coeffs,
@@ -99,9 +104,15 @@ def dct_compress_matrix(x, retention_ratio):
         'num_keep': num_keep
     }
 
-def idct_decompress_matrix(compressed_kv, original_device, original_dtype):
+def idct_decompress_matrix(compressed_kv, original_device, original_dtype, keep_compressed_length=False):
     """
-    使用矩阵乘法进行 IDCT 解压 (含补零)
+    使用矩阵乘法进行 IDCT 解压
+    
+    Args:
+        compressed_kv: 压缩的 KV 字典
+        original_device: 目标设备
+        original_dtype: 目标数据类型
+        keep_compressed_length: 如果为 True，IDCT 后保持压缩长度（不补零）
     """
     if compressed_kv is None:
         return None
@@ -110,21 +121,36 @@ def idct_decompress_matrix(compressed_kv, original_device, original_dtype):
     L = compressed_kv['original_seq_len']
     B, H, K, D = coeffs.shape
     
-    # 1. 补零 (Zero Padding) 恢复到 [B, H, L, D]
-    if L > K:
-        coeffs_padded = F.pad(coeffs, (0, 0, 0, L - K))
-    else:
-        coeffs_padded = coeffs
+    if keep_compressed_length:
+        # [新方案] 不补零，直接用 K×K 的 IDCT 矩阵
+        # 结果：[B, H, K, D] 时域（压缩版本）
+        M = get_dct_matrix(K, coeffs.dtype, coeffs.device)
         
-    # 2. 获取变换矩阵 M: [L, L]
-    M = get_dct_matrix(L, coeffs.dtype, coeffs.device)
-    
-    # 3. 执行 IDCT
-    coeffs_permuted = coeffs_padded.permute(0, 1, 3, 2)
-    reconstructed_transposed = torch.matmul(coeffs_permuted, M)
-    reconstructed = reconstructed_transposed.permute(0, 1, 3, 2)
-    
-    return reconstructed.to(original_dtype).to(original_device)
+        coeffs_permuted = coeffs.permute(0, 1, 3, 2)
+        reconstructed_transposed = torch.matmul(coeffs_permuted, M)
+        reconstructed = reconstructed_transposed.permute(0, 1, 3, 2)
+        
+        # [Debug] 打印解压信息
+        if DEBUG and torch.rand(1).item() < 0.01:
+            print(f"  [Decompress] Kept compressed: {L} -> {K} tokens (saved {(1-K/L)*100:.1f}% memory)")
+        
+        return reconstructed.to(original_dtype).to(original_device)
+    else:
+        # [原方案] 补零到原长度 [B, H, L, D]
+        if L > K:
+            coeffs_padded = F.pad(coeffs, (0, 0, 0, L - K))
+        else:
+            coeffs_padded = coeffs
+            
+        # 获取变换矩阵 M: [L, L]
+        M = get_dct_matrix(L, coeffs.dtype, coeffs.device)
+        
+        # 执行 IDCT
+        coeffs_permuted = coeffs_padded.permute(0, 1, 3, 2)
+        reconstructed_transposed = torch.matmul(coeffs_permuted, M)
+        reconstructed = reconstructed_transposed.permute(0, 1, 3, 2)
+        
+        return reconstructed.to(original_dtype).to(original_device)
 
 
 # ===================== 1. 基础工具函数 =====================
@@ -297,6 +323,9 @@ def generate_with_dual_cache(
     # [Debug] 初始显存
     if DEBUG:
         print(f"\n[Dual Cache Mode] Matrix ASKV: {use_spectral_compression}")
+        if use_spectral_compression:
+            print(f"  Compression Strategy: {'Keep Compressed Length' if KEEP_COMPRESSED_LENGTH else 'Zero Padding'}")
+            print(f"  Safety Buffer: {SAFETY_BUFFER_SIZE} tokens")
         print(f"Initial VRAM: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
     for nb in range(num_blocks):
@@ -351,7 +380,8 @@ def generate_with_dual_cache(
                             # 特殊情况：不使用 safety buffer，压缩整个 prefix
                             if prefix.shape[2] >= MIN_COMPRESS_LENGTH:
                                 c_stable = dct_compress_matrix(prefix, current_retention)
-                                r_pre = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype)
+                                r_pre = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype, 
+                                                               keep_compressed_length=KEEP_COMPRESSED_LENGTH)
                             else:
                                 # prefix 太短，不压缩
                                 r_pre = prefix
@@ -364,7 +394,8 @@ def generate_with_dual_cache(
                                 recent = prefix[:, :, -SAFETY_BUFFER_SIZE:, :]
                                 
                                 c_stable = dct_compress_matrix(stable, current_retention)
-                                r_stable = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype)
+                                r_stable = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype,
+                                                                  keep_compressed_length=KEEP_COMPRESSED_LENGTH)
                                 
                                 r_pre = torch.cat([r_stable, recent], dim=2)
                             else:
@@ -379,8 +410,29 @@ def generate_with_dual_cache(
                 new_past_key_values.append(tuple(layer_kv))
             past_key_values = tuple(new_past_key_values)
 
-        replace_pos = torch.zeros_like(x, dtype=torch.bool)
-        replace_pos[:, s:e] = True 
+        # [Fix] 计算压缩后的实际序列长度
+        if use_spectral_compression and KEEP_COMPRESSED_LENGTH:
+            # 获取压缩后的实际 KV 长度
+            actual_kv_len = past_key_values[0][0].shape[2]
+            # r_pre（压缩后）+ current + r_suf = actual_kv_len
+            # current block 在压缩后 KV 中的实际位置
+            # 从 reconstructed = torch.cat([r_pre, current, r_suf], dim=2) 可知
+            # current 的起始位置 = r_pre 的长度
+            compressed_prefix_len = actual_kv_len - (e - s) - (x.shape[1] - e)
+            new_s = compressed_prefix_len
+            new_e = new_s + (e - s)
+            
+            # 创建与压缩后 KV 长度匹配的 replace_position
+            replace_pos = torch.zeros((B, actual_kv_len), dtype=torch.bool, device=x.device)
+            replace_pos[:, new_s:new_e] = True
+            
+            if DEBUG and nb == 0:
+                print(f"  [Compressed KV] Original seq: {x.shape[1]}, Compressed KV: {actual_kv_len}")
+                print(f"  [Replace Pos] Original: [{s}:{e}], Compressed: [{new_s}:{new_e}]")
+        else:
+            # 原方案：长度不变
+            replace_pos = torch.zeros_like(x, dtype=torch.bool)
+            replace_pos[:, s:e] = True 
         
         global_mask = (x == mask_id); global_mask[:, e:] = False
         if factor is None:
@@ -448,6 +500,9 @@ def generate_with_prefix_cache(
     # [Debug] 打印模式信息
     if DEBUG:
         print(f"\n[Prefix Cache Mode] Matrix ASKV: {use_spectral_compression}")
+        if use_spectral_compression:
+            print(f"  Compression Strategy: {'Keep Compressed Length' if KEEP_COMPRESSED_LENGTH else 'Zero Padding'}")
+            print(f"  Safety Buffer: {SAFETY_BUFFER_SIZE} tokens")
             
     for num_block in range(num_blocks):
         # [Debug] 计时开始
@@ -496,7 +551,8 @@ def generate_with_prefix_cache(
                                 # 特殊情况：不使用 safety buffer，压缩整个 prefix
                                 if prefix.shape[2] >= MIN_COMPRESS_LENGTH:
                                     c_stable = dct_compress_matrix(prefix, current_retention)
-                                    r_pre = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype)
+                                    r_pre = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype,
+                                                                   keep_compressed_length=KEEP_COMPRESSED_LENGTH)
                                 else:
                                     # prefix 太短，不压缩
                                     r_pre = prefix
@@ -509,7 +565,8 @@ def generate_with_prefix_cache(
                                     recent = prefix[:, :, -SAFETY_BUFFER_SIZE:, :]
                                     
                                     c_stable = dct_compress_matrix(stable, current_retention)
-                                    r_stable = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype)
+                                    r_stable = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype,
+                                                                      keep_compressed_length=KEEP_COMPRESSED_LENGTH)
                                     
                                     r_pre = torch.cat([r_stable, recent], dim=2)
                                 else:
