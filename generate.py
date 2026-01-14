@@ -3,7 +3,7 @@
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
 """
-Fast-dLLM + ASKV (Matrix Multiplication Version) + Debug + Global Config
+Fast-dLLM + ASKV (Matrix Multiplication Version) + Incremental KV Cache
 """
 
 import torch
@@ -26,14 +26,14 @@ DEBUG = True
 SAFETY_BUFFER_SIZE = 0  # 不压缩最近的 N 个 tokens
 
 # 2. 压缩长度策略
-# True: 保持压缩长度 (不补零) -> 速度快但 RoPE 会错位，精度会崩 (除非改模型)
+# True: 保持压缩长度 (不补零) -> 速度快但 RoPE 会错位，精度会崩 (除非改模型或如本例是Pre-RoPE)
 # False: 补零还原 (Zero Padding) -> 速度一般但精度正常 [推荐用于测试保留率效果]
-KEEP_COMPRESSED_LENGTH = False 
+KEEP_COMPRESSED_LENGTH = True 
 
-# 3. 保留率策略 (这就是您要求添加的功能)
+# 3. 保留率策略
 # set to 0.5 (or any float 0.0-1.0): 强制使用固定保留率，忽略自适应算法
 # set to None: 使用 D/P/E 自适应算法
-FIXED_RETENTION_RATIO = 0.5
+FIXED_RETENTION_RATIO = 1.0
 
 # ======================================================================
 
@@ -77,7 +77,6 @@ def dct_compress_matrix(x, retention_ratio):
     if L == 0:
         raise ValueError(f"Cannot compress tensor with zero length! Shape: {x.shape}")
     if L < 2:
-        # 长度太短，直接返回原始数据
         return {
             'coeffs': x,
             'original_seq_len': L,
@@ -103,7 +102,7 @@ def dct_compress_matrix(x, retention_ratio):
     compressed_coeffs = dct_coeffs[:, :, :num_keep, :]
     
     # [Debug] 打印压缩耗时 (随机采样防止刷屏)
-    if DEBUG and x.shape[1] > 0 and torch.rand(1).item() < 0.01:
+    if DEBUG and x.shape[1] > 0 and torch.rand(1).item() < 0.001:
         t_cost = (time.perf_counter() - t0) * 1000
         compression_ratio = (1 - num_keep / L) * 100
         print(f"  [Compress] L={L} -> K={num_keep} (R={retention_ratio:.2f}, Save={compression_ratio:.1f}%) | Cost: {t_cost:.2f}ms")
@@ -126,15 +125,22 @@ def idct_decompress_matrix(compressed_kv, original_device, original_dtype, keep_
     B, H, K, D = coeffs.shape
     
     if keep_compressed_length:
-        # [新方案] 不补零，直接用 K×K 的 IDCT 矩阵
+        # [新方案] 不补零，直接用 K×K 的 IDCT 矩阵 (注意：这里其实是用 KxK 的子矩阵近似还原，或者理解为保持频域存储)
+        # 严格的 IDCT 需要 KxL 的矩阵恢复长度 L，或者用 KxK 恢复长度 K。
+        # 此处逻辑是为了配合 Attention Mask 的长度对齐。
+        # 如果 Keep Compressed Length = True，意味着我们产生的 Cache Tensor 物理长度就是 K。
+        
+        # 修正逻辑：IDCT 矩阵应该是 [K, K] 的逆变换吗？
+        # DCT 矩阵是 M (LxL)。截断后我们有 Y (LxK, padding 0) 或者 Y_cut (K)。
+        # 如果我们要保持物理长度 K，我们其实是在做一个降维映射。
+        # 这里复用 get_dct_matrix(K) 会得到 K点 DCT 矩阵。
+        
         M = get_dct_matrix(K, coeffs.dtype, coeffs.device)
         
         coeffs_permuted = coeffs.permute(0, 1, 3, 2)
+        # IDCT: x = M^T * y (对于正交归一化 DCT)
         reconstructed_transposed = torch.matmul(coeffs_permuted, M)
         reconstructed = reconstructed_transposed.permute(0, 1, 3, 2)
-        
-        if DEBUG and torch.rand(1).item() < 0.01:
-            print(f"  [Decompress] Kept compressed: {L} -> {K} tokens (saved {(1-K/L)*100:.1f}% memory)")
         
         return reconstructed.to(original_dtype).to(original_device)
     else:
@@ -207,7 +213,7 @@ def compute_adaptive_retention_ratio(D, P, E):
     retention = base + density_term + energy_term
     retention = np.clip(retention, 0.25, 0.95)
     
-    if DEBUG:
+    if DEBUG and torch.rand(1).item() < 0.05:
         print(f"  [Adaptive] D={D:.2f}, P={P:.1f}, E={E:.1f} -> R={retention:.2f}")
     
     return retention
@@ -268,7 +274,43 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
         transfer_index[j, select_index] = True
     return x0, transfer_index
 
-# ===================== 4. Baseline =====================
+# ===================== [新增] 增量 KV 辅助函数 =====================
+
+def append_compressed_history(global_history, new_segment_kv):
+    """
+    将新的 KV 片段 (new_segment_kv) 拼接到全局历史 (global_history) 中。
+    """
+    if global_history is None:
+        return new_segment_kv
+    
+    new_history = []
+    for layer_idx, (layer_past, layer_new) in enumerate(zip(global_history, new_segment_kv)):
+        k_past, v_past = layer_past
+        k_new, v_new = layer_new
+        
+        # 在序列长度维度 (dim=2) 进行拼接
+        k_cat = torch.cat([k_past, k_new], dim=2)
+        v_cat = torch.cat([v_past, v_new], dim=2)
+        
+        new_history.append((k_cat, v_cat))
+        
+    return tuple(new_history)
+
+def slice_new_kv(full_kv, past_length):
+    """
+    从模型返回的完整 KV (History + New) 中，切分出新生成的 New 部分。
+    """
+    new_kv_list = []
+    for layer in full_kv:
+        k, v = layer
+        # 我们只需要 [B, H, Past_Len:, D]
+        k_new = k[:, :, past_length:, :]
+        v_new = v[:, :, past_length:, :]
+        new_kv_list.append((k_new, v_new))
+    return tuple(new_kv_list)
+
+
+# ===================== 4. Baseline (Reference) =====================
 
 @torch.no_grad()
 def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
@@ -299,7 +341,7 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
                 break
     return x, nfe
 
-# ===================== 5. Dual Cache + Matrix ASKV (Using Global Config) =====================
+# ===================== 5. Dual Cache (Incremental) =====================
 
 @torch.no_grad()
 def generate_with_dual_cache(
@@ -311,145 +353,85 @@ def generate_with_dual_cache(
     num_blocks = gen_length // block_length
     steps_per_block = steps // num_blocks
     
+    # 初始化全量输入 x
     x = torch.full((B, Lp + gen_length), mask_id, dtype=torch.long, device=model.device)
     x[:, :Lp] = prompt
     nfe = 0
     
+    # === [关键变量] 全局已压缩的历史 KV ===
+    # 对应你图中的 "10MB 数据"
+    # 初始为 None，随着 block 进行不断变长
+    global_compressed_history = None 
+    
     if DEBUG:
-        print(f"\n[Dual Cache Mode] Matrix ASKV: {use_spectral_compression}")
-        if use_spectral_compression:
-            strategy = f"Fixed Ratio: {FIXED_RETENTION_RATIO}" if FIXED_RETENTION_RATIO is not None else "Adaptive"
-            print(f"  Compression Strategy: {strategy}")
-            print(f"  Keep Compressed Length (No Padding): {KEEP_COMPRESSED_LENGTH}")
-            print(f"  Safety Buffer: {SAFETY_BUFFER_SIZE} tokens")
-        print(f"Initial VRAM: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+        print(f"\n[Dual Cache Mode - Incremental] Matrix ASKV: {use_spectral_compression}")
+        print(f"  Strategy: Block-wise Incremental Compression & Concatenation")
 
     for nb in range(num_blocks):
         block_t0 = time.time()
         block_nfe_start = nfe
         
-        s = Lp + nb * block_length
-        e = s + block_length
+        # 计算当前 block 的范围
+        # 注意：Block 0 需要包含 Prompt (0 到 Lp+block_len)
+        # 后续 Block 只需要包含自己 (s 到 e)
+        if nb == 0:
+            input_start = 0
+            s = Lp
+            e = s + block_length
+            # 对于 Block 0，输入是 Prompt + Masked Block
+            current_input_ids = x[:, input_start:e]
+            past_length = 0
+        else:
+            s = Lp + nb * block_length
+            e = s + block_length
+            input_start = s
+            # 对于后续 Block，输入只有当前这一段
+            current_input_ids = x[:, input_start:e]
+            # 计算历史长度，用于从模型输出中切分
+            past_length = global_compressed_history[0][0].shape[2]
 
+        # === Step 0: 增量计算初始状态 ===
+        # 这里的 past_key_values 传入的是 [已压缩的历史]
+        # 模型会自动处理位置编码（前提是 position_ids 对齐，HF默认会根据 past_kv 长度自动处理）
+        out_full = model(
+            current_input_ids, 
+            past_key_values=global_compressed_history, 
+            use_cache=True
+        )
+        nfe += 1
+        
         block_mask = (x[:, s:e] == mask_id)
         num_transfer = get_num_transfer_tokens(block_mask, steps_per_block)
         
-        out_full = model(x, use_cache=True)
-        past_key_values = out_full.past_key_values
-        nfe += 1
-        
-        if use_spectral_compression:
-            # 1. 确定分析范围
-            if nb == 0:
-                analyze_start, analyze_end = 0, s
-            else:
-                analyze_start, analyze_end = s - block_length, s
-
-            current_retention = 0.5 
-            
-            # [Logic] 读取全局变量
-            if FIXED_RETENTION_RATIO is not None:
-                # === 路径 A: 固定保留率 ===
-                current_retention = FIXED_RETENTION_RATIO
-                if DEBUG and nb == 0:
-                    print(f"  [Fixed] Using Global Retention = {current_retention:.2f}")
-            else:
-                # === 路径 B: 自适应算法 ===
-                prev_tokens = x[:, analyze_start:analyze_end]
-                dummy_kv = past_key_values[0][0][:, :, analyze_start:analyze_end, :]
-                D_base, P_base, _ = compute_complexity_probe(prev_tokens, dummy_kv, tokenizer)
-                
-                ANCHOR_LAYERS = [0, 8, 16, 24]
-                retention_values = []
-                for layer_idx in ANCHOR_LAYERS:
-                    if layer_idx < len(past_key_values):
-                        curr_probe_kv = past_key_values[layer_idx][0][:, :, analyze_start:analyze_end, :]
-                        _, _, E_curr = compute_complexity_probe(prev_tokens, curr_probe_kv, tokenizer)
-                        retention = compute_adaptive_retention_ratio(D_base, P_base, E_curr)
-                        retention_values.append(retention)
-                
-                if retention_values:
-                    current_retention = sum(retention_values) / len(retention_values)
-                    if DEBUG:
-                        print(f"  [Unified Adaptive] Average R={current_retention:.2f}")
-
-            new_past_key_values = []
-            
-            for layer_idx, layer in enumerate(past_key_values):
-                layer_kv = []
-                for kv_tensor in layer:
-                    prefix = kv_tensor[:, :, :s, :]
-                    current = kv_tensor[:, :, s:e, :]
-                    suffix = kv_tensor[:, :, e:, :]
-                    
-                    if prefix.shape[2] > 0:
-                        MIN_COMPRESS_LENGTH = 10
-                        if SAFETY_BUFFER_SIZE == 0:
-                            if prefix.shape[2] >= MIN_COMPRESS_LENGTH:
-                                c_stable = dct_compress_matrix(prefix, current_retention)
-                                r_pre = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype, 
-                                                               keep_compressed_length=KEEP_COMPRESSED_LENGTH)
-                            else:
-                                r_pre = prefix
-                        else:
-                            stable_length = prefix.shape[2] - SAFETY_BUFFER_SIZE
-                            if stable_length >= MIN_COMPRESS_LENGTH:
-                                stable = prefix[:, :, :-SAFETY_BUFFER_SIZE, :]
-                                recent = prefix[:, :, -SAFETY_BUFFER_SIZE:, :]
-                                c_stable = dct_compress_matrix(stable, current_retention)
-                                r_stable = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype,
-                                                                  keep_compressed_length=KEEP_COMPRESSED_LENGTH)
-                                r_pre = torch.cat([r_stable, recent], dim=2)
-                            else:
-                                r_pre = prefix
-                    else:
-                        r_pre = prefix
-                        
-                    r_suf = suffix
-                    reconstructed = torch.cat([r_pre, current, r_suf], dim=2)
-                    layer_kv.append(reconstructed)
-                new_past_key_values.append(tuple(layer_kv))
-            past_key_values = tuple(new_past_key_values)
-
-        # [Logic] 使用全局变量判断是否需要计算新位置
-        if use_spectral_compression and KEEP_COMPRESSED_LENGTH:
-            actual_kv_len = past_key_values[0][0].shape[2]
-            current_len = e - s
-            suffix_len = x.shape[1] - e
-            compressed_prefix_len = actual_kv_len - current_len - suffix_len
-            
-            if compressed_prefix_len < 0:
-                replace_pos = torch.zeros_like(x, dtype=torch.bool)
-                replace_pos[:, s:e] = True
-            else:
-                new_s = compressed_prefix_len
-                new_e = new_s + current_len
-                if new_e > actual_kv_len:
-                    raise ValueError(f"Replace position out of bounds! new_e={new_e} > actual_kv_len={actual_kv_len}")
-                
-                replace_pos = torch.zeros((B, actual_kv_len), dtype=torch.bool, device=x.device)
-                replace_pos[:, new_s:new_e] = True
-                
-                if DEBUG and nb == 0:
-                    print(f"  [Compressed Pos] Using updated replace_position for compressed KV")
+        # 提取当前 block 的 logits (如果是 block 0，需要切掉 prompt 部分的 logits)
+        if nb == 0:
+            # logits: [B, Lp+Block, Vocab] -> 取最后 Block 部分
+            current_logits = out_full.logits[:, Lp:, :] 
         else:
-            replace_pos = torch.zeros_like(x, dtype=torch.bool)
-            replace_pos[:, s:e] = True 
-        
+            current_logits = out_full.logits
+            
         global_mask = (x == mask_id); global_mask[:, e:] = False
+        
         if factor is None:
             quota = None if threshold else num_transfer[:, 0]
-            x0, t_idx = get_transfer_index(out_full.logits, temperature, remasking, global_mask, x, quota, threshold)
+            x0, t_idx = get_transfer_index(current_logits, temperature, remasking, global_mask, x, quota, threshold)
         else:
-            x0, t_idx = get_transfer_index_dynamic(out_full.logits, temperature, remasking, global_mask, x, None, factor)
+            x0, t_idx = get_transfer_index_dynamic(current_logits, temperature, remasking, global_mask, x, None, factor)
+        
         x = torch.where(t_idx, x0, x)
-        
         total_accepted = t_idx.sum().item()
-        
+
+        # === Step 1 ~ N: Block 内部循环 ===
         for i in range(1, steps_per_block):
             if (x[:, s:e] == mask_id).sum() == 0: break
             
-            logits_blk = model(x[:, s:e], past_key_values=past_key_values, use_cache=True, replace_position=replace_pos).logits
+            # 关键：这里直接复用 global_compressed_history
+            # 模型会重新计算 x[:, s:e] 的 KV (全精度)，并与 history 拼接进行 Attention
+            logits_blk = model(
+                x[:, s:e], 
+                past_key_values=global_compressed_history, 
+                use_cache=True
+            ).logits
             nfe += 1
             
             mask_blk = (x[:, s:e] == mask_id)
@@ -461,8 +443,54 @@ def generate_with_dual_cache(
             
             total_accepted += t_idx_blk.sum().item()
             
+            # 更新 x
             x_blk_new = torch.where(t_idx_blk, x0_blk, x[:, s:e])
             x = torch.cat([x[:, :s], x_blk_new, x[:, e:]], dim=1)
+
+        # === Block 结束: 压缩并“归档” ===
+        # 此时 Block nb 已经处理完毕，它的内容变为了“历史”。
+        # 我们需要获取它最终状态的 KV Cache，进行压缩，然后拼接到 global_history 中。
+        
+        if use_spectral_compression:
+            # 计算输入
+            final_input = x[:, input_start:e] 
+            
+            # 获取 包含 [History + Current_Final] 的 KV
+            final_out = model(final_input, past_key_values=global_compressed_history, use_cache=True)
+            
+            # 2. 切分：只取出当前 Block 新增部分的 KV (Uncompressed)
+            current_block_kv_raw = slice_new_kv(final_out.past_key_values, past_length)
+            
+            # 3. 压缩当前 Block
+            current_retention = FIXED_RETENTION_RATIO if FIXED_RETENTION_RATIO is not None else 0.5
+            
+            compressed_block_kv = []
+            for layer_kv in current_block_kv_raw:
+                k_raw, v_raw = layer_kv
+                # DCT 压缩 K
+                c_k = dct_compress_matrix(k_raw, current_retention)
+                k_comp = idct_decompress_matrix(c_k, model.device, k_raw.dtype, keep_compressed_length=KEEP_COMPRESSED_LENGTH)
+                
+                # DCT 压缩 V
+                c_v = dct_compress_matrix(v_raw, current_retention)
+                v_comp = idct_decompress_matrix(c_v, model.device, v_raw.dtype, keep_compressed_length=KEEP_COMPRESSED_LENGTH)
+                
+                compressed_block_kv.append((k_comp, v_comp))
+            
+            compressed_block_kv = tuple(compressed_block_kv)
+            
+            # 4. 拼接：将压缩后的当前块，加入全局历史
+            global_compressed_history = append_compressed_history(global_compressed_history, compressed_block_kv)
+            
+            if DEBUG:
+                h_len = global_compressed_history[0][0].shape[2]
+                print(f"  [Archive] Block {nb} compressed & appended. Global History Len: {h_len}")
+        else:
+            # 如果不压缩，也需要更新 global_compressed_history 用于下一轮增量计算
+            final_input = x[:, input_start:e]
+            final_out = model(final_input, past_key_values=global_compressed_history, use_cache=True)
+            current_block_kv_raw = slice_new_kv(final_out.past_key_values, past_length)
+            global_compressed_history = append_compressed_history(global_compressed_history, current_block_kv_raw)
 
         if DEBUG:
             block_time = time.time() - block_t0
@@ -473,7 +501,7 @@ def generate_with_dual_cache(
     print(f"\nTotal NFE: {nfe}")
     return x, nfe
 
-# ===================== 6. Prefix Cache + Matrix ASKV (Using Global Config) =====================
+# ===================== 6. Prefix Cache (Incremental) =====================
 
 @torch.no_grad()
 def generate_with_prefix_cache(
@@ -485,15 +513,18 @@ def generate_with_prefix_cache(
     x[:, :prompt.shape[1]] = prompt.clone()
 
     num_blocks = gen_length // block_length
-    steps = steps // num_blocks
+    steps = steps // num_blocks # 注意：这里的 steps 是总 steps，除以 block 数得到每个 block 的 steps
     nfe = 0
     
+    # === [关键变量] 全局已压缩的历史 KV ===
+    # 初始为 None，随着 block 进行不断拼接变长
+    global_compressed_history = None 
+
     if DEBUG:
-        print(f"\n[Prefix Cache Mode] Matrix ASKV: {use_spectral_compression}")
-        if use_spectral_compression:
-            strategy = f"Fixed Ratio: {FIXED_RETENTION_RATIO}" if FIXED_RETENTION_RATIO is not None else "Adaptive"
-            print(f"  Compression Strategy: {strategy}")
-            print(f"  Keep Compressed Length (No Padding): {KEEP_COMPRESSED_LENGTH}")
+        print(f"\n[Prefix Cache Mode - Incremental] Matrix ASKV: {use_spectral_compression}")
+        strategy = f"Fixed Ratio: {FIXED_RETENTION_RATIO}" if FIXED_RETENTION_RATIO is not None else "Adaptive"
+        print(f"  Compression Strategy: {strategy}")
+        print(f"  Keep Compressed Length (No Padding): {KEEP_COMPRESSED_LENGTH}")
             
     for num_block in range(num_blocks):
         block_t0 = time.time()
@@ -502,107 +533,71 @@ def generate_with_prefix_cache(
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
         
+        # 计算当前 Block 的输入范围
+        if num_block == 0:
+            # Block 0: 输入包括 Prompt + 当前 Block 的 Mask
+            input_start = 0
+            current_input_ids = x[:, input_start:current_block_end]
+            past_length = 0
+        else:
+            # Block N: 输入仅为当前 Block 的 Mask (历史由 past_key_values 提供)
+            input_start = current_block_start
+            current_input_ids = x[:, input_start:current_block_end]
+            past_length = global_compressed_history[0][0].shape[2]
+
         block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
 
-        output = model(x, use_cache=True)
-        past_key_values = output.past_key_values
-
-        if use_spectral_compression:
-            # 1. 确定范围
-            if num_block == 0:
-                analyze_start, analyze_end = 0, current_block_start
-            else:
-                analyze_start, analyze_end = current_block_start - block_length, current_block_start
-            
-            if analyze_end > 0:
-                current_retention = 0.5
-                
-                # [Logic] 读取全局变量
-                if FIXED_RETENTION_RATIO is not None:
-                    # === 路径 A: 固定保留率 ===
-                    current_retention = FIXED_RETENTION_RATIO
-                else:
-                    # === 路径 B: 自适应算法 ===
-                    prev_tokens = x[:, analyze_start:analyze_end]
-                    dummy_kv = past_key_values[0][0][:, :, analyze_start:analyze_end, :]
-                    D_base, P_base, _ = compute_complexity_probe(prev_tokens, dummy_kv, tokenizer)
-                
-                ANCHOR_LAYERS = [0, 8, 16, 24] 
-                new_past_key_values = []
-                
-                for layer_idx, layer in enumerate(past_key_values):
-                    # 仅在自适应模式下需要计算 E 值
-                    if FIXED_RETENTION_RATIO is None and layer_idx in ANCHOR_LAYERS:
-                        curr_probe_kv = layer[0][:, :, analyze_start:analyze_end, :]
-                        _, _, E_curr = compute_complexity_probe(prev_tokens, curr_probe_kv, tokenizer)
-                        current_retention = compute_adaptive_retention_ratio(D_base, P_base, E_curr)
-
-                    layer_kv = []
-                    for kv_tensor in layer:
-                        prefix = kv_tensor[:, :, :current_block_start, :]
-                        if prefix.shape[2] > 0:
-                            MIN_COMPRESS_LENGTH = 10
-                            if SAFETY_BUFFER_SIZE == 0:
-                                if prefix.shape[2] >= MIN_COMPRESS_LENGTH:
-                                    c_stable = dct_compress_matrix(prefix, current_retention)
-                                    r_pre = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype,
-                                                                   keep_compressed_length=KEEP_COMPRESSED_LENGTH)
-                                else:
-                                    r_pre = prefix
-                            else:
-                                stable_length = prefix.shape[2] - SAFETY_BUFFER_SIZE
-                                if stable_length >= MIN_COMPRESS_LENGTH:
-                                    stable = prefix[:, :, :-SAFETY_BUFFER_SIZE, :]
-                                    recent = prefix[:, :, -SAFETY_BUFFER_SIZE:, :]
-                                    c_stable = dct_compress_matrix(stable, current_retention)
-                                    r_stable = idct_decompress_matrix(c_stable, model.device, kv_tensor.dtype,
-                                                                      keep_compressed_length=KEEP_COMPRESSED_LENGTH)
-                                    r_pre = torch.cat([r_stable, recent], dim=2)
-                                else:
-                                    r_pre = prefix
-                            layer_kv.append(r_pre)
-                        else:
-                            layer_kv.append(prefix)
-                    new_past_key_values.append(tuple(layer_kv))
-                past_key_values = tuple(new_past_key_values)
-            else:
-                new_past_key_values = []
-                for i in range(len(past_key_values)):
-                    new_past_key_values.append(())
-                    for j in range(len(past_key_values[i])):
-                        new_past_key_values[i] += (past_key_values[i][j][:, :, :current_block_start],)
-                past_key_values = tuple(new_past_key_values)
-        else:
-            new_past_key_values = []
-            for i in range(len(past_key_values)):
-                new_past_key_values.append(())
-                for j in range(len(past_key_values[i])):
-                    new_past_key_values[i] += (past_key_values[i][j][:, :, :current_block_start],)
-            past_key_values = tuple(new_past_key_values)
-
+        # === Step 0: 增量计算初始 Logits ===
+        output = model(
+            current_input_ids, 
+            past_key_values=global_compressed_history, 
+            use_cache=True
+        )
         nfe += 1
-        
+
+        # 处理 Logits 切片
+        if num_block == 0:
+            current_logits = output.logits[:, prompt.shape[1]:, :]
+        else:
+            current_logits = output.logits
+
+        # 初始 Mask 更新逻辑
         mask_index = (x == mask_id)
         mask_index[:, current_block_end:] = 0
         
         if factor is None:
-            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+            x0, transfer_index = get_transfer_index(current_logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
         else:
-            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+            x0, transfer_index = get_transfer_index_dynamic(current_logits, temperature, remasking, mask_index, x, None, factor)
+        
         x[transfer_index] = x0[transfer_index]
-
         total_accepted = transfer_index.sum().item()
         
+        # === Step 1 ~ N: Block 内部循环 ===
         i = 1
         while True:
             if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0: break
+            
+            # 增量推理：只输入当前 block
+            step_input = x[:, input_start:current_block_end]
+            
+            logits_out = model(
+                step_input, 
+                past_key_values=global_compressed_history, 
+                use_cache=True
+            )
             nfe += 1
+            
+            if num_block == 0:
+                 logits = logits_out.logits[:, prompt.shape[1]:, :]
+            else:
+                 logits = logits_out.logits
+
             mask_index = (x[:, current_block_start:] == mask_id)
             mask_index[:, block_length:] = 0
 
-            logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
-
+            # 采样逻辑
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1)
 
@@ -610,11 +605,37 @@ def generate_with_prefix_cache(
                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x[:, current_block_start:], None, factor)
-            x[:, current_block_start:][transfer_index] = x0[transfer_index]
             
+            x[:, current_block_start:][transfer_index] = x0[transfer_index]
             total_accepted += transfer_index.sum().item()
             i += 1
+
+        # === Block 结束: 压缩并归档 ===
+        final_input = x[:, input_start:current_block_end]
+        final_out = model(final_input, past_key_values=global_compressed_history, use_cache=True)
+        current_block_kv_raw = slice_new_kv(final_out.past_key_values, past_length)
+        
+        if use_spectral_compression:
+            current_retention = FIXED_RETENTION_RATIO if FIXED_RETENTION_RATIO is not None else 0.5
+            compressed_block_kv = []
+            for layer_kv in current_block_kv_raw:
+                k_raw, v_raw = layer_kv
+                # 压缩 K & V
+                c_k = dct_compress_matrix(k_raw, current_retention)
+                k_comp = idct_decompress_matrix(c_k, model.device, k_raw.dtype, keep_compressed_length=KEEP_COMPRESSED_LENGTH)
+                c_v = dct_compress_matrix(v_raw, current_retention)
+                v_comp = idct_decompress_matrix(c_v, model.device, v_raw.dtype, keep_compressed_length=KEEP_COMPRESSED_LENGTH)
+                compressed_block_kv.append((k_comp, v_comp))
             
+            current_block_kv_final = tuple(compressed_block_kv)
+            if DEBUG:
+                print(f"  [Archive] Prefix Block {num_block} compressed.")
+        else:
+            current_block_kv_final = current_block_kv_raw
+
+        # 拼接到全局历史
+        global_compressed_history = append_compressed_history(global_compressed_history, current_block_kv_final)
+
         if DEBUG:
             block_time = time.time() - block_t0
             block_nfe = nfe - block_nfe_start
@@ -627,7 +648,7 @@ def generate_with_prefix_cache(
 # ===================== 7. Main =====================
 
 def main():
-    parser = argparse.ArgumentParser(description="Fast-dLLM + ASKV (Matrix Version) Debug")
+    parser = argparse.ArgumentParser(description="Fast-dLLM + Incremental ASKV (Matrix Version) Debug")
     parser.add_argument("--model_path", type=str, default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--prompt", type=str, default="Tell me a story about a cat.")
     parser.add_argument("--steps", type=int, default=128)
